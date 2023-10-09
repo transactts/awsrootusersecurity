@@ -1,0 +1,355 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 
+  This CloudFormation stack creates an SNS topic that notifies the subscribed email user when the AWS root user account is used
+  The CFN stack should be named xxx-war-sec1-root-notification
+  It is assumed that this policy with be run from the 
+  CloudFormation console by the WAR recipient and has been written accordingly.
+  Resource Tagging should be added in consultation with the Client.
+  This function expects an Account Alias to have been setup for the AWS Account
+  The CloudFormation script must be run from the US-EAST-1 region.
+  QC XX 23092023
+
+
+
+
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Amazon SNS parameters
+        Parameters:
+          - EmailAddress
+          - SNSTopicName
+      - Label:
+          default: AWS Lambda parameters
+        Parameters:
+          - LambdaTimeout
+
+# Section 1. Parameters
+
+Parameters:
+  EmailAddress:
+    Type: String
+    AllowedPattern: "^[\\x20-\\x45]?[\\w-\\+]+(\\.[\\w]+)*@[\\w-]+(\\.[\\w]+)*(\\.[a-z]{2,})$"
+    ConstraintDescription: Email address required.
+    Description: Enter an email address you want to subscribe to the Amazon SNS topic
+      that will send notifications if your account's AWS root user logs in.
+
+  
+  SNSTopicName:
+    Description: Name the SNS topic
+    Type: String
+    Default: Root-Activity
+
+  LambdaTimeout:
+    Type: Number
+    Default: '60'
+    Description: Enter a timeout value in seconds for the lambda function. Min is
+      3, max is 300 and default is 60.
+
+  LambdaFunctionName:
+    Type: String
+    Default: Sec1RootActivityNotification
+    Description: Enter a Name for the root activity notification Lambda.
+
+
+  CloudTrailBucketName:
+    Type: String
+    AllowedPattern: ^[a-zA-Z0-9.-]{3,63}$  # Modify this pattern as needed      
+    Description: Enter a unique name for the S3 bucket. 
+      Bucket names must be between 3 (min) and 63 (max) characters long. 
+      Bucket names can consist only of lowercase letters, numbers, dots (.), and hyphens (-). 
+      Bucket names must begin and end with a letter or number
+
+
+Resources:
+# Section 2. SNS Topic
+  RootActivitySNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: Root Activity on AWS Account ALERT
+      KmsMasterKeyId:  alias/aws/sns
+      Subscription:
+        - Endpoint: !Ref EmailAddress
+          Protocol: email
+      TopicName: !Ref SNSTopicName
+
+
+# Section 3. CloudTrail trail with target S3 bucket and bucket policy
+
+  RootActivityCloudTrailBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref CloudTrailBucketName
+      AccessControl: Private
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Suspended
+
+
+
+
+  RootActivityCloudTrailBucketPolicy:
+      Type: AWS::S3::BucketPolicy
+      Properties:
+        Bucket:
+          Ref: RootActivityCloudTrailBucket
+        PolicyDocument:
+          Statement:
+            - Sid: AWSCloudTrailAclCheck
+              Effect: Allow
+              Principal:
+                Service: cloudtrail.amazonaws.com
+              Action: s3:GetBucketAcl
+              Resource: !Sub arn:aws:s3:::${CloudTrailBucketName}
+            - Sid: AWSCloudTrailWrite
+              Effect: Allow
+              Principal:
+                Service: cloudtrail.amazonaws.com
+              Action: s3:PutObject
+              Resource: !Sub arn:aws:s3:::${CloudTrailBucketName}/*
+              Condition:
+                StringEquals:
+                  s3:x-amz-acl: bucket-owner-full-control
+
+# A multi-region AWS CloudTrail is required that has management events with
+# both read and write enabled.
+
+  RootActivityTrail:
+    Type: AWS::CloudTrail::Trail
+    DependsOn: 
+      - RootActivityCloudTrailBucketPolicy
+    Properties:
+      IsLogging: true
+      S3BucketName: !Ref CloudTrailBucketName
+      IncludeGlobalServiceEvents: true
+      IsMultiRegionTrail: true
+      EnableLogFileValidation: true
+      EventSelectors:
+        - ReadWriteType: All
+          IncludeManagementEvents: true
+          DataResources:
+            - Type: AWS::S3::Object
+              Values:
+                - !Sub arn:aws:s3:::${CloudTrailBucketName}/*
+
+
+# Section 4. Event Rule that monitors root API activity
+
+
+# EventsRule is critical, it triggers the Lambda
+# when root activity takes place
+
+  EventsRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Events rule for monitoring root API activity
+      EventPattern:
+        detail-type:
+          - AWS API Call via CloudTrail
+          - AWS Console Sign In via CloudTrail
+        detail:
+          userIdentity:
+            type:
+              - Root
+      Name: !Sub '${AWS::StackName}-RootActivityRule'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt 'RootActivityLambda.Arn'
+          Id: !Ref AWS::StackName
+
+
+# Section 5 5. Lambda to parse event detail and send informative email to SNS Topic
+
+# Lambda is triggered when EventRule occurs
+# and sends emails to nominated email address
+
+  RootActivityLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt 'LambdaRootAPIMonitorRole.Arn'
+      FunctionName: !Ref LambdaFunctionName
+      Runtime: python3.8
+      MemorySize: 128
+      Timeout: !Ref 'LambdaTimeout'
+      Environment:
+        Variables:
+          RootActivitySnsArnEnv: !Ref RootActivitySNSTopic
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+          import botocore.session
+          from datetime import datetime
+          from dateutil import tz
+          from botocore.exceptions import ClientError
+
+          session = botocore.session.get_session()
+
+          logging.basicConfig(level=logging.DEBUG)
+          logger = logging.getLogger(__name__)
+
+          # Lambda entry point
+          def lambda_handler(event, context):
+              logger.setLevel(logging.DEBUG)
+
+              event_name = event['detail']['eventName']
+              sns_arn = os.environ['RootActivitySnsArnEnv']  # Getting the SNS Topic ARN passed in by the environment variables.
+              user = event['detail']['userIdentity']['type']
+              account_id = event['detail']['userIdentity']['accountId']
+              region = event["region"]
+              event_time = event["time"]
+
+              logger.debug("Event is --- %s" % event)
+              logger.debug("Event Name is--- %s" % event_name)
+              logger.debug("RootActivitySnsArnEnv is-- %s" % sns_arn)
+              logger.debug("User Name is -- %s" % user)
+              logger.debug("Event Time is--- %s" % event_time)
+              logger.debug("Account Id  is-- %s" % account_id)
+              logger.debug("User Name is -- %s" % user)
+              logger.debug("Region is -- %s" % region)
+
+              # Create timezone objects for UTC,  UK & Ireland time
+              # The dateutil library is used to handle timezone conversions to 
+              utc_timezone = tz.UTC
+              uki_timezone = tz.gettz('Europe/London')
+              
+              # Convert the event time string to a datetime object
+              event_time = datetime.strptime(event_time, '%Y-%m-%dT%H:%M:%SZ')
+
+              # Set the event time's timezone to UTC
+              event_time_utc = event_time.replace(tzinfo=utc_timezone)
+
+              # Convert the event time from UTC to UK & Ireland time
+              event_time_uki = event_time_utc.astimezone(uki_timezone)
+
+              # Convert the datetime object to the UK & Ireland format for date and time
+              uki_date = event_time_uki.strftime('%d-%m-%Y')
+              uki_time = event_time_uki.strftime('%H:%M:%S')
+
+              logger.debug("Date is -- %s" % uki_date)
+              logger.debug("Time is -- %s" % uki_time)
+
+              client = boto3.client('iam')
+              sns_client = boto3.client('sns')
+              response = client.list_account_aliases()
+              logger.debug("List Account Alias response --- %s" % response)
+
+              try:
+                  if not response['AccountAliases']:
+                      accnt_alias = boto3.client('sts').get_caller_identity()['Account']
+                      logger.info("Account Alias is not defined. Account ID is %s" % accnt_alias)
+                  else:
+                      accnt_alias = response['AccountAliases'][0]
+                      logger.info("Account Alias is: %s" % accnt_alias)
+              except ClientError as e:
+                  logger.error("Client Error occurred")
+
+              sns_message = (
+                  f"The {user} user from {accnt_alias} with Account Id {account_id} used the {event_name} service "
+                  f"at {uki_time} on {uki_date} in the {region} Region.\n\n " # /n/n new line for ease of reading
+                  f"Full Event Detail is given below:\n\n"
+                  f"{json.dumps(event)}"
+              )
+
+
+              try:
+                  # Sending the notification with Subject limited to 100 Characters
+                  snspublish = sns_client.publish(
+                      TargetArn=sns_arn,
+                      Subject=("The \"%s\" was used by root in Account-\"%s\"" % (event_name, accnt_alias))[:100],
+                      Message=sns_message
+
+                  )
+                  logger.debug("SNS publish response is-- %s" % snspublish)
+              except ClientError as e:
+                  logger.error("An error occurred: %s" % e)
+
+# Section 6. Lambda Role, Policies and Permissions
+
+# Lambda functions require permission to write CloudWatch Logs
+
+  RootActivityLambdaIAMPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Policy to allow Lambda to access CloudWatch
+      ManagedPolicyName: RootActivityLambdaPolicy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+            Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*
+          - Effect: Allow
+            Action:
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource:
+              - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${LambdaFunctionName}:*
+
+
+  LambdaRootAPIMonitorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action: sts:AssumeRole
+      RoleName: !Sub '${AWS::StackName}-LambdaRootAPIMonitorRole'
+
+  LambdaRootAPIMonitorPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: LogStreamAccess
+            Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource:
+              - arn:aws:logs:*:*:*
+          - Sid: SNSPublishAllow
+            Effect: Allow
+            Action:
+              - sns:Publish
+            Resource:
+              - arn:aws:sns:*:*:*
+          - Sid: ListAccountAlias
+            Action:
+              - iam:ListAccountAliases
+            Effect: Allow
+            Resource: '*'
+      PolicyName: !Sub '${AWS::StackName}-LambdaRootAPIMonitorPolicy'
+      Roles:
+        - !Ref LambdaRootAPIMonitorRole
+
+  LambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref RootActivityLambda
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt 'EventsRule.Arn'
+
+
+
